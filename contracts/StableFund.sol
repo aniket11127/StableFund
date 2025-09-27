@@ -1,25 +1,47 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
-/// @notice Minimal ERC20 interface used by the contract
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 value) external returns (bool);
-    function transfer(address to, uint256 value) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-    function decimals() external view returns (uint8);
-}
+/*
+ Refined StableFund
+ - Uses OpenZeppelin's SafeERC20 wrapper for safe token interactions
+ - Tracks collected withdrawal fees separately (collectedFees)
+ - Admin can set a treasury address and claim collected fees
+ - Improved events and custom errors for gas savings
+ - Kept original behaviour / API mostly same but safer/cleaner
+*/
+
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract StableFund {
+    using SafeERC20 for IERC20;
+
+    /* ========== ERRORS (gas efficient) ========== */
+    error ZeroAddress();
+    error NotAdmin();
+    error ContractPaused();
+    error AmountZero();
+    error AmountBelowMinimum();
+    error InsufficientBalance();
+    error ArrayLengthMismatch();
+    error FeeTooHigh();
+    error InvalidPercent();
+    error NotAuthorized();
+    error TransferFailed();
+    error NotPaused();
+
     /* ========== STATE ========== */
 
     address public admin;
     IERC20 public immutable stableToken;
+    address public treasury; // where fees are claimed to
     uint256 public totalDeposits;
+    uint256 public collectedFees; // accumulated fees from withdrawals (in token smallest units)
 
-    /// @notice minimum deposit in token smallest units (i.e., considering token decimals)
+    /// minimum deposit in token smallest units
     uint256 public minimumDeposit;
 
-    /// @notice withdrawalFee in basis points (1 bp = 0.01%). e.g., 50 => 0.5%
+    /// withdrawalFee in basis points (1 bp = 0.01%). e.g., 50 => 0.5%
     uint256 public withdrawalFee;
 
     bool public paused;
@@ -34,7 +56,8 @@ contract StableFund {
 
     /* ========== EVENTS ========== */
     event Deposited(address indexed user, uint256 amount);
-    event Withdrawn(address indexed user, uint256 amount, uint256 fee);
+    /// gross = requested amount, fee = fee taken, net = amount sent to user
+    event Withdrawn(address indexed user, uint256 gross, uint256 fee, uint256 net);
     event Rebalanced(uint256 totalDeposits, uint256 contractBalance);
     event AdminChanged(address indexed oldAdmin, address indexed newAdmin);
     event MinimumDepositUpdated(uint256 oldAmount, uint256 newAmount);
@@ -42,6 +65,8 @@ contract StableFund {
     event ContractPaused(bool paused);
     event UserAuthorized(address indexed user, bool authorized);
     event EmergencyWithdrawal(address indexed admin, uint256 amount);
+    event FeesClaimed(address indexed treasury, uint256 amount);
+    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
 
     /* ========== REENTRANCY GUARD ========== */
     uint256 private _status;
@@ -58,17 +83,17 @@ contract StableFund {
     /* ========== MODIFIERS ========== */
 
     modifier onlyAdmin() {
-        require(msg.sender == admin, "Not admin");
+        if (msg.sender != admin) revert NotAdmin();
         _;
     }
 
     modifier whenNotPaused() {
-        require(!paused, "Contract paused");
+        if (paused) revert ContractPaused();
         _;
     }
 
     modifier onlyAuthorizedOrAdmin() {
-        require(msg.sender == admin || authorizedUsers[msg.sender], "Not authorized");
+        if (msg.sender != admin && !authorizedUsers[msg.sender]) revert NotAuthorized();
         _;
     }
 
@@ -78,7 +103,8 @@ contract StableFund {
     /// @param _minimumDeposit minimum deposit in token smallest unit (e.g., for 18-decimals pass 100 * 10**18)
     /// @param _withdrawalFee basis points (50 = 0.5%)
     constructor(address tokenAddress, uint256 _minimumDeposit, uint256 _withdrawalFee) {
-        require(tokenAddress != address(0), "Zero token address");
+        if (tokenAddress == address(0)) revert ZeroAddress();
+        if (_withdrawalFee > 1000) revert FeeTooHigh(); // cap 10%
         admin = msg.sender;
         stableToken = IERC20(tokenAddress);
         minimumDeposit = _minimumDeposit;
@@ -91,11 +117,11 @@ contract StableFund {
 
     /// @notice deposit tokens from msg.sender
     function deposit(uint256 amount) external whenNotPaused nonReentrant {
-        require(amount > 0, "Amount must be > 0");
-        require(amount >= minimumDeposit, "Amount below minimum");
+        if (amount == 0) revert AmountZero();
+        if (amount < minimumDeposit) revert AmountBelowMinimum();
 
-        // pull tokens
-        require(stableToken.transferFrom(msg.sender, address(this), amount), "TransferFrom failed");
+        // pull tokens safely
+        stableToken.safeTransferFrom(msg.sender, address(this), amount);
 
         _addBalance(msg.sender, amount);
         emit Deposited(msg.sender, amount);
@@ -103,40 +129,38 @@ contract StableFund {
 
     /// @notice withdraw `amount` (fee is applied)
     function withdraw(uint256 amount) public whenNotPaused nonReentrant {
-        require(amount > 0, "Amount must be > 0");
-        require(balances[msg.sender] >= amount, "Insufficient balance");
+        if (amount == 0) revert AmountZero();
+        uint256 userBal = balances[msg.sender];
+        if (userBal < amount) revert InsufficientBalance();
 
         uint256 fee = calculateWithdrawalFee(amount);
         uint256 net = amount - fee;
 
         // update accounting BEFORE external call
-        balances[msg.sender] -= amount;
+        balances[msg.sender] = userBal - amount;
         totalDeposits -= amount;
 
-        // update user existence if balance becomes zero (optional)
-        if (balances[msg.sender] == 0 && _isUser[msg.sender]) {
-            // keep totalUsers as historical count (do not decrement) to avoid complexity/gas;
-            // if you want to decrement, uncomment below — note: iterating users costly.
-            // _isUser[msg.sender] = false;
-            // totalUsers -= 1;
-        }
-
-        require(stableToken.transfer(msg.sender, net), "Transfer failed");
+        // record fee for later claim
         if (fee > 0) {
-            // keep fee in contract (or send to admin treasury in future)
+            collectedFees += fee;
         }
 
-        emit Withdrawn(msg.sender, net, fee);
+        // transfer net amount
+        stableToken.safeTransfer(msg.sender, net);
+
+        emit Withdrawn(msg.sender, amount, fee, net);
     }
 
     /// @notice partial withdraw by percentage (1-100)
     function partialWithdraw(uint256 percentage) external whenNotPaused {
-        require(percentage > 0 && percentage <= 100, "Invalid percent");
+        if (percentage == 0 || percentage > 100) revert InvalidPercent();
         uint256 userBal = balances[msg.sender];
-        require(userBal > 0, "No balance");
+        if (userBal == 0) revert InsufficientBalance();
 
         uint256 amount = (userBal * percentage) / 100;
-        // call withdraw (nonReentrant prevents external reentry)
+        // amount could be zero if userBal < 100 and percentage small; guard:
+        if (amount == 0) revert AmountZero();
+
         withdraw(amount);
     }
 
@@ -149,15 +173,15 @@ contract StableFund {
         whenNotPaused
         nonReentrant
     {
-        require(users.length == amounts.length, "Array length mismatch");
+        if (users.length != amounts.length) revert ArrayLengthMismatch();
         uint256 len = users.length;
 
         for (uint256 i = 0; i < len; ) {
             address u = users[i];
             uint256 amt = amounts[i];
-            require(amt >= minimumDeposit, "Amount below minimum");
+            if (amt < minimumDeposit) revert AmountBelowMinimum();
 
-            require(stableToken.transferFrom(msg.sender, address(this), amt), "TransferFrom failed");
+            stableToken.safeTransferFrom(msg.sender, address(this), amt);
 
             _addBalance(u, amt);
             emit Deposited(u, amt);
@@ -196,16 +220,17 @@ contract StableFund {
     function getContractStats() external view returns (
         uint256 _totalUsers,
         uint256 contractBalance,
-        uint256 averageBalance
+        uint256 averageBalance,
+        uint256 _collectedFees
     ) {
         contractBalance = stableToken.balanceOf(address(this));
         _totalUsers = totalUsers;
         averageBalance = 0;
         if (_totalUsers > 0) {
-            // average of recorded totalDeposits (note: could use contractBalance as well)
             averageBalance = totalDeposits / _totalUsers;
         }
-        return (_totalUsers, contractBalance, averageBalance);
+        _collectedFees = collectedFees;
+        return (_totalUsers, contractBalance, averageBalance, _collectedFees);
     }
 
     function getBalance(address user) external view returns (uint256) {
@@ -240,7 +265,7 @@ contract StableFund {
 
     /// @notice change admin
     function changeAdmin(address newAdmin) external onlyAdmin {
-        require(newAdmin != address(0), "Invalid address");
+        if (newAdmin == address(0)) revert ZeroAddress();
         address old = admin;
         admin = newAdmin;
         authorizedUsers[newAdmin] = true;
@@ -256,7 +281,7 @@ contract StableFund {
 
     /// @notice set withdrawal fee in basis points (max 1000 => 10%)
     function setWithdrawalFee(uint256 newFee) external onlyAdmin {
-        require(newFee <= 1000, "Fee > 10%");
+        if (newFee > 1000) revert FeeTooHigh();
         uint256 old = withdrawalFee;
         withdrawalFee = newFee;
         emit WithdrawalFeeUpdated(old, newFee);
@@ -272,6 +297,26 @@ contract StableFund {
         emit UserAuthorized(user, authorized);
     }
 
+    /// @notice set treasury where collected fees will be claimed to
+    function setTreasury(address _treasury) external onlyAdmin {
+        if (_treasury == address(0)) revert ZeroAddress();
+        address old = treasury;
+        treasury = _treasury;
+        emit TreasuryUpdated(old, _treasury);
+    }
+
+    /// @notice admin can claim collected fees to treasury
+    function claimFees(uint256 amount) external onlyAdmin nonReentrant {
+        if (treasury == address(0)) revert ZeroAddress();
+        if (amount == 0) revert AmountZero();
+        if (amount > collectedFees) revert InsufficientBalance();
+
+        collectedFees -= amount;
+        stableToken.safeTransfer(treasury, amount);
+
+        emit FeesClaimed(treasury, amount);
+    }
+
     /// @notice rebalance check (no automatic external calls, just report)
     function rebalance() external onlyAdmin {
         uint256 contractBalance = stableToken.balanceOf(address(this));
@@ -281,10 +326,10 @@ contract StableFund {
 
     /// @notice emergency withdraw to admin — only allowed when paused
     function emergencyWithdraw(uint256 amount) external onlyAdmin nonReentrant {
-        require(paused, "Contract must be paused");
+        if (!paused) revert NotPaused();
         uint256 contractBal = stableToken.balanceOf(address(this));
-        require(amount <= contractBal, "Amount > contract balance");
-        require(stableToken.transfer(admin, amount), "Emergency transfer failed");
+        if (amount > contractBal) revert InsufficientBalance();
+        stableToken.safeTransfer(admin, amount);
         emit EmergencyWithdrawal(admin, amount);
     }
 
@@ -299,5 +344,16 @@ contract StableFund {
         balances[user] += amount;
         totalDeposits += amount;
         lastDepositTime[user] = block.timestamp;
+    }
+
+    /* ========== FALLBACKS ========== */
+
+    receive() external payable {
+        // reject ETH
+        revert();
+    }
+
+    fallback() external payable {
+        revert();
     }
 }
